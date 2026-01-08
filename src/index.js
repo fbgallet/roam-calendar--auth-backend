@@ -43,12 +43,19 @@ app.get('/health', (req, res) => {
  */
 app.post('/oauth/token', async (req, res) => {
   const { code, redirect_uri } = req.body;
+  const requestId = Date.now().toString(36); // Simple request ID for log correlation
+
+  console.log(`[${requestId}] Token exchange request received`);
+  console.log(`[${requestId}] redirect_uri: ${redirect_uri || 'postmessage (default)'}`);
+  console.log(`[${requestId}] code length: ${code ? code.length : 0} chars`);
 
   if (!code) {
+    console.log(`[${requestId}] ERROR: Missing authorization code`);
     return res.status(400).json({ error: 'Missing authorization code' });
   }
 
   try {
+    console.log(`[${requestId}] Exchanging code with Google...`);
     const response = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -64,12 +71,17 @@ app.post('/oauth/token', async (req, res) => {
     const data = await response.json();
 
     if (data.error) {
-      console.error('Token exchange error:', data);
+      console.error(`[${requestId}] Token exchange error from Google: ${data.error}`);
+      console.error(`[${requestId}] Error description: ${data.error_description || 'none'}`);
       return res.status(400).json({ error: data.error, description: data.error_description });
     }
 
     // Return tokens to client
     // IMPORTANT: The client should securely store the refresh_token
+    console.log(`[${requestId}] SUCCESS: Token exchange complete`);
+    console.log(`[${requestId}] Received refresh_token: ${data.refresh_token ? 'yes' : 'no'}`);
+    console.log(`[${requestId}] Token expires_in: ${data.expires_in}s`);
+
     res.json({
       access_token: data.access_token,
       refresh_token: data.refresh_token,
@@ -78,7 +90,7 @@ app.post('/oauth/token', async (req, res) => {
       scope: data.scope,
     });
   } catch (error) {
-    console.error('Token exchange failed:', error);
+    console.error(`[${requestId}] Token exchange failed:`, error.message);
     res.status(500).json({ error: 'Token exchange failed' });
   }
 });
