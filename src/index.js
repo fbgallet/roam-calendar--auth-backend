@@ -19,6 +19,21 @@ const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.split(',') || ['https://roamresearch.com'];
 
+// In-memory storage for pending OAuth sessions (for Desktop polling)
+// Format: { sessionId: { code, state, error, timestamp } }
+const pendingAuthSessions = new Map();
+
+// Clean up old sessions every 5 minutes (sessions expire after 10 minutes)
+setInterval(() => {
+  const now = Date.now();
+  const expireTime = 10 * 60 * 1000; // 10 minutes
+  for (const [sessionId, data] of pendingAuthSessions) {
+    if (now - data.timestamp > expireTime) {
+      pendingAuthSessions.delete(sessionId);
+    }
+  }
+}, 5 * 60 * 1000);
+
 // Middleware
 app.use(express.json());
 app.use(cors({
@@ -42,6 +57,9 @@ app.get('/health', (req, res) => {
  * OAuth callback endpoint (redirect flow)
  * Google redirects here after user grants permission
  * This page posts the auth code back to the opener window and closes
+ *
+ * For Desktop apps (no opener), the state may contain a session ID for polling:
+ * Format: csrfState|sessionId
  */
 app.get('/oauth/callback', (req, res) => {
   const { code, state, error } = req.query;
@@ -51,6 +69,27 @@ app.get('/oauth/callback', (req, res) => {
   console.log(`[${requestId}] Has code: ${!!code}, Has state: ${!!state}, Has error: ${!!error}`);
   if (error) {
     console.log(`[${requestId}] OAuth error: ${error}`);
+  }
+
+  // Check if state contains a session ID (format: csrfState|sessionId)
+  let sessionId = null;
+  let csrfState = state;
+  if (state && state.includes('|')) {
+    const parts = state.split('|');
+    csrfState = parts[0];
+    sessionId = parts[1];
+    console.log(`[${requestId}] Desktop session detected: ${sessionId}`);
+  }
+
+  // If we have a session ID, store the auth data for polling
+  if (sessionId) {
+    pendingAuthSessions.set(sessionId, {
+      code: code || null,
+      state: csrfState, // Store original CSRF state without session ID
+      error: error || null,
+      timestamp: Date.now()
+    });
+    console.log(`[${requestId}] Stored auth data for session: ${sessionId}`);
   }
 
   // Send HTML that posts message back to opener and closes
@@ -69,22 +108,54 @@ app.get('/oauth/callback', (req, res) => {
 <body>
   <div class="container">
     <h1>${error ? 'Authentication Failed' : 'Authentication Complete'}</h1>
-    <p>${error ? 'Please close this window and try again.' : 'You can close this window now.'}</p>
+    <p>${error ? 'Please close this window and try again.' : 'You can close this window and return to Roam.'}</p>
   </div>
   <script>
+    // Try postMessage for browser popup flow
     if (window.opener) {
       window.opener.postMessage({
         type: 'oauth-callback',
         code: ${JSON.stringify(code || null)},
-        state: ${JSON.stringify(state || null)},
+        state: ${JSON.stringify(csrfState || null)},
         error: ${JSON.stringify(error || null)}
       }, '*');
+      setTimeout(() => window.close(), 1500);
     }
-    setTimeout(() => window.close(), 1500);
+    // For Desktop (no opener), the page just shows the message
+    // and the app polls /oauth/poll to get the auth data
   </script>
 </body>
 </html>
   `);
+});
+
+/**
+ * Poll for OAuth completion (Desktop app flow)
+ * Desktop apps can't receive postMessage, so they poll this endpoint
+ */
+app.get('/oauth/poll', (req, res) => {
+  const { session } = req.query;
+
+  if (!session) {
+    return res.status(400).json({ error: 'Missing session parameter' });
+  }
+
+  const authData = pendingAuthSessions.get(session);
+
+  if (!authData) {
+    // Session not found or not yet completed
+    return res.json({ status: 'pending' });
+  }
+
+  // Found! Return the auth data and clean up
+  pendingAuthSessions.delete(session);
+
+  res.json({
+    status: 'completed',
+    code: authData.code,
+    state: authData.state,
+    error: authData.error
+  });
 });
 
 /**
