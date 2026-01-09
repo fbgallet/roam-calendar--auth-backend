@@ -2,9 +2,10 @@
  * OAuth Backend for Roam Calendar Extension
  *
  * Endpoints:
- *   POST /oauth/token   - Exchange authorization code for tokens
- *   POST /oauth/refresh - Refresh an expired access token
- *   GET  /health        - Health check
+ *   GET  /oauth/callback - OAuth redirect callback (for redirect flow)
+ *   POST /oauth/token    - Exchange authorization code for tokens
+ *   POST /oauth/refresh  - Refresh an expired access token
+ *   GET  /health         - Health check
  */
 
 const express = require('express');
@@ -35,6 +36,55 @@ app.use(cors({
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+/**
+ * OAuth callback endpoint (redirect flow)
+ * Google redirects here after user grants permission
+ * This page posts the auth code back to the opener window and closes
+ */
+app.get('/oauth/callback', (req, res) => {
+  const { code, state, error } = req.query;
+  const requestId = Date.now().toString(36);
+
+  console.log(`[${requestId}] OAuth callback received`);
+  console.log(`[${requestId}] Has code: ${!!code}, Has state: ${!!state}, Has error: ${!!error}`);
+  if (error) {
+    console.log(`[${requestId}] OAuth error: ${error}`);
+  }
+
+  // Send HTML that posts message back to opener and closes
+  res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Authentication Complete</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f5f5f5; }
+    .container { text-align: center; padding: 40px; background: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+    h1 { color: #333; margin-bottom: 10px; }
+    p { color: #666; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>${error ? 'Authentication Failed' : 'Authentication Complete'}</h1>
+    <p>${error ? 'Please close this window and try again.' : 'You can close this window now.'}</p>
+  </div>
+  <script>
+    if (window.opener) {
+      window.opener.postMessage({
+        type: 'oauth-callback',
+        code: ${JSON.stringify(code || null)},
+        state: ${JSON.stringify(state || null)},
+        error: ${JSON.stringify(error || null)}
+      }, '*');
+    }
+    setTimeout(() => window.close(), 1500);
+  </script>
+</body>
+</html>
+  `);
 });
 
 /**
