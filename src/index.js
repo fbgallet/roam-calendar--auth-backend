@@ -3,13 +3,16 @@
  *
  * Endpoints:
  *   GET  /oauth/callback - OAuth redirect callback (for redirect flow)
+ *   GET  /oauth/poll     - Poll for OAuth completion (Desktop app flow)
  *   POST /oauth/token    - Exchange authorization code for tokens
  *   POST /oauth/refresh  - Refresh an expired access token
  *   GET  /health         - Health check
+ *   GET  /stats          - Analytics and usage statistics
  */
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -18,6 +21,27 @@ const PORT = process.env.PORT || 3000;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
 const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS?.split(',') || ['https://roamresearch.com'];
+
+// Analytics storage (in-memory)
+const analytics = {
+  uniqueUsers: new Set(), // Stores hashed IPs
+  tokenExchanges: { total: 0, success: 0, failed: 0 },
+  tokenRefreshes: { total: 0, success: 0, failed: 0 },
+  startTime: new Date().toISOString()
+};
+
+// Helper: Hash IP for privacy
+function hashIP(ip) {
+  return crypto.createHash('sha256').update(ip + 'salt').digest('hex').substring(0, 16);
+}
+
+// Helper: Get client IP
+function getClientIP(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0].trim() ||
+         req.headers['x-real-ip'] ||
+         req.connection.remoteAddress ||
+         req.socket.remoteAddress;
+}
 
 // In-memory storage for pending OAuth sessions (for Desktop polling)
 // Format: { sessionId: { code, state, error, timestamp } }
@@ -53,6 +77,34 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// Analytics endpoint
+app.get('/stats', (req, res) => {
+  const uptime = Math.floor((Date.now() - new Date(analytics.startTime).getTime()) / 1000);
+
+  res.json({
+    startTime: analytics.startTime,
+    uptimeSeconds: uptime,
+    uniqueUsers: analytics.uniqueUsers.size,
+    tokenExchanges: {
+      total: analytics.tokenExchanges.total,
+      success: analytics.tokenExchanges.success,
+      failed: analytics.tokenExchanges.failed,
+      successRate: analytics.tokenExchanges.total > 0
+        ? `${((analytics.tokenExchanges.success / analytics.tokenExchanges.total) * 100).toFixed(1)}%`
+        : 'N/A'
+    },
+    tokenRefreshes: {
+      total: analytics.tokenRefreshes.total,
+      success: analytics.tokenRefreshes.success,
+      failed: analytics.tokenRefreshes.failed,
+      successRate: analytics.tokenRefreshes.total > 0
+        ? `${((analytics.tokenRefreshes.success / analytics.tokenRefreshes.total) * 100).toFixed(1)}%`
+        : 'N/A'
+    },
+    totalRequests: analytics.tokenExchanges.total + analytics.tokenRefreshes.total
+  });
+});
+
 /**
  * OAuth callback endpoint (redirect flow)
  * Google redirects here after user grants permission
@@ -63,12 +115,9 @@ app.get('/health', (req, res) => {
  */
 app.get('/oauth/callback', (req, res) => {
   const { code, state, error } = req.query;
-  const requestId = Date.now().toString(36);
 
-  console.log(`[${requestId}] OAuth callback received`);
-  console.log(`[${requestId}] Has code: ${!!code}, Has state: ${!!state}, Has error: ${!!error}`);
   if (error) {
-    console.log(`[${requestId}] OAuth error: ${error}`);
+    console.log(`OAuth callback error: ${error}`);
   }
 
   // Check if state contains a session ID (format: csrfState|sessionId)
@@ -78,18 +127,16 @@ app.get('/oauth/callback', (req, res) => {
     const parts = state.split('|');
     csrfState = parts[0];
     sessionId = parts[1];
-    console.log(`[${requestId}] Desktop session detected: ${sessionId}`);
   }
 
   // If we have a session ID, store the auth data for polling
   if (sessionId) {
     pendingAuthSessions.set(sessionId, {
       code: code || null,
-      state: csrfState, // Store original CSRF state without session ID
+      state: csrfState,
       error: error || null,
       timestamp: Date.now()
     });
-    console.log(`[${requestId}] Stored auth data for session: ${sessionId}`);
   }
 
   // Send HTML that posts message back to opener and closes
@@ -164,19 +211,20 @@ app.get('/oauth/poll', (req, res) => {
  */
 app.post('/oauth/token', async (req, res) => {
   const { code, redirect_uri } = req.body;
-  const requestId = Date.now().toString(36); // Simple request ID for log correlation
+  const clientIP = getClientIP(req);
+  const hashedIP = hashIP(clientIP);
 
-  console.log(`[${requestId}] Token exchange request received`);
-  console.log(`[${requestId}] redirect_uri: ${redirect_uri || 'postmessage (default)'}`);
-  console.log(`[${requestId}] code length: ${code ? code.length : 0} chars`);
+  // Track analytics
+  analytics.tokenExchanges.total++;
+  analytics.uniqueUsers.add(hashedIP);
 
   if (!code) {
-    console.log(`[${requestId}] ERROR: Missing authorization code`);
+    analytics.tokenExchanges.failed++;
+    console.log('Token exchange failed: Missing authorization code');
     return res.status(400).json({ error: 'Missing authorization code' });
   }
 
   try {
-    console.log(`[${requestId}] Exchanging code with Google...`);
     const response = await fetch('https://oauth2.googleapis.com/token', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -185,23 +233,21 @@ app.post('/oauth/token', async (req, res) => {
         client_secret: GOOGLE_CLIENT_SECRET,
         code,
         grant_type: 'authorization_code',
-        redirect_uri: redirect_uri || 'postmessage', // 'postmessage' for popup flow
+        redirect_uri: redirect_uri || 'postmessage',
       }),
     });
 
     const data = await response.json();
 
     if (data.error) {
-      console.error(`[${requestId}] Token exchange error from Google: ${data.error}`);
-      console.error(`[${requestId}] Error description: ${data.error_description || 'none'}`);
+      analytics.tokenExchanges.failed++;
+      console.error(`Token exchange error: ${data.error} - ${data.error_description || 'no description'}`);
       return res.status(400).json({ error: data.error, description: data.error_description });
     }
 
-    // Return tokens to client
-    // IMPORTANT: The client should securely store the refresh_token
-    console.log(`[${requestId}] SUCCESS: Token exchange complete`);
-    console.log(`[${requestId}] Received refresh_token: ${data.refresh_token ? 'yes' : 'no'}`);
-    console.log(`[${requestId}] Token expires_in: ${data.expires_in}s`);
+    // Success
+    analytics.tokenExchanges.success++;
+    console.log('Token exchange successful');
 
     res.json({
       access_token: data.access_token,
@@ -211,7 +257,8 @@ app.post('/oauth/token', async (req, res) => {
       scope: data.scope,
     });
   } catch (error) {
-    console.error(`[${requestId}] Token exchange failed:`, error.message);
+    analytics.tokenExchanges.failed++;
+    console.error('Token exchange failed:', error.message);
     res.status(500).json({ error: 'Token exchange failed' });
   }
 });
@@ -222,8 +269,15 @@ app.post('/oauth/token', async (req, res) => {
  */
 app.post('/oauth/refresh', async (req, res) => {
   const { refresh_token } = req.body;
+  const clientIP = getClientIP(req);
+  const hashedIP = hashIP(clientIP);
+
+  // Track analytics
+  analytics.tokenRefreshes.total++;
+  analytics.uniqueUsers.add(hashedIP);
 
   if (!refresh_token) {
+    analytics.tokenRefreshes.failed++;
     return res.status(400).json({ error: 'Missing refresh token' });
   }
 
@@ -242,12 +296,14 @@ app.post('/oauth/refresh', async (req, res) => {
     const data = await response.json();
 
     if (data.error) {
-      console.error('Token refresh error:', data);
+      analytics.tokenRefreshes.failed++;
+      console.error(`Token refresh error: ${data.error}`);
       return res.status(400).json({ error: data.error, description: data.error_description });
     }
 
-    // Return new access token
-    // Note: Google typically doesn't return a new refresh_token
+    // Success
+    analytics.tokenRefreshes.success++;
+
     res.json({
       access_token: data.access_token,
       expires_in: data.expires_in,
@@ -255,7 +311,8 @@ app.post('/oauth/refresh', async (req, res) => {
       scope: data.scope,
     });
   } catch (error) {
-    console.error('Token refresh failed:', error);
+    analytics.tokenRefreshes.failed++;
+    console.error('Token refresh failed:', error.message);
     res.status(500).json({ error: 'Token refresh failed' });
   }
 });
